@@ -41,8 +41,8 @@ done
 [[ -z $SYSTEM ]] && red "不支持当前VPS系统, 请使用主流的操作系统" && exit 1
 
 check_ip(){
-    ipv4=$(curl -s4m8 ip.sb -k | sed -n 1p)
-    ipv6=$(curl -s6m8 ip.sb -k | sed -n 1p)
+    ipv4=$(curl -s4m8 ip.p3terx.com -k | sed -n 1p)
+    ipv6=$(curl -s6m8 ip.p3terx.com -k | sed -n 1p)
 }
 
 inst_acme(){
@@ -108,6 +108,97 @@ switch_provider(){
     esac
 }
 
+acme_standalone(){
+    [[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && inst_acme
+
+    # 感谢Wulabing前辈提供的检查80端口思路
+    # Source: https://github.com/wulabing/Xray_onekey
+    
+    if [[ -z $(type -P lsof) ]]; then
+        if [[ ! $SYSTEM == "CentOS" ]]; then
+            ${PACKAGE_UPDATE[int]}
+        fi
+        ${PACKAGE_INSTALL[int]} lsof
+    fi
+
+    local sslPort=80
+    
+    yellow "正在检测 80 端口是否占用..."
+    sleep 1
+    
+    if [[ $(lsof -i:"80" | grep -i -c "listen") -eq 0 ]]; then
+        green "检测到目前 80 端口未被占用"
+        sleep 1
+    else
+        red "检测到目前 80 端口被其他程序被占用，以下为占用程序信息"
+        lsof -i:"80"
+        read -rp "如需结束占用进程请按Y，按其他键则退出 [Y/N]: " yn
+        if [[ $yn =~ "Y"|"y" ]]; then
+            lsof -i:"80" | awk '{print $2}' | grep -v "PID" | xargs kill -9
+            sleep 1
+            if [[ ! $(lsof -i:"80" | grep -i -c "listen") -eq 0 ]]; then
+                red "检测到 80 端口无法解除占用，可使用其他端口以进行申请证书"
+                read -p "请输入需要使用的端口:" sslPort
+            fi
+        else
+            exit 1
+        fi
+    fi
+
+    WARPv4Status=$(curl -s4m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
+    WARPv6Status=$(curl -s6m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
+    if [[ $WARPv4Status =~ on|plus ]] || [[ $WARPv6Status =~ on|plus ]]; then
+        wg-quick down wgcf >/dev/null 2>&1
+        systemctl stop warp-go >/dev/null 2>&1
+    fi
+    
+    check_ip
+
+    echo ""
+    yellow "在使用 80 端口申请模式时, 请先将您的域名解析至你的 VPS 的真实 IP 地址, 否则会导致证书申请失败"
+    echo ""
+    if [[ -n $ipv4 && -n $ipv6 ]]; then
+        echo -e "VPS 的真实 IPv4 地址为: ${GREEN}$ipv4${PLAIN}"
+        echo -e "VPS 的真实 IPv6 地址为: ${GREEN}$ipv6${PLAIN}"
+    elif [[ -n $ipv4 && -z $ipv6 ]]; then
+        echo -e "VPS 的真实 IPv4 地址为: ${GREEN}$ipv4${PLAIN}"
+    elif [[ -z $ipv4 && -n $ipv6 ]]; then
+        echo -e "VPS 的真实 IPv6 地址为: ${GREEN}$ipv6${PLAIN}"
+    fi
+    echo ""
+
+    read -rp "请输入解析完成的域名: " domain
+    [[ -z $domain ]] && red "未输入域名，无法执行操作！" && exit 1
+    green "已输入的域名：$domain" && sleep 1
+
+    domainIP=$(dig @8.8.8.8 +time=2 +short "$domain" 2>/dev/null | sed -n 1p)
+    if echo $domainIP | grep -q "network unreachable\|timed out" || [[ -z $domainIP ]]; then
+        domainIP=$(dig @2001:4860:4860::8888 +time=2 aaaa +short "$domain" 2>/dev/null | sed -n 1p)
+    fi
+    if echo $domainIP | grep -q "network unreachable\|timed out" || [[ -z $domainIP ]] ; then
+        red "未解析出 IP，请检查域名是否输入有误" 
+        yellow "是否尝试强行匹配？"
+        green "1. 是，将使用强行匹配"
+        green "2. 否，退出脚本"
+        read -p "请输入选项 [1-2]：" ipChoice
+        if [[ $ipChoice == 1 ]]; then
+            yellow "将尝试强行匹配以申请域名证书"
+        else
+            red "将退出脚本"
+            exit 1
+        fi
+    fi
+
+    if [[ $domainIP == $ipv6 ]]; then
+        bash ~/.acme.sh/acme.sh --issue -d ${domain} --standalone -k ec-256 --listen-v6 --insecure --httpport ${sslPort}
+    fi
+    if [[ $domainIP == $ipv4 ]]; then
+        bash ~/.acme.sh/acme.sh --issue -d ${domain} --standalone -k ec-256 --insecure --httpport ${sslPort}
+    fi
+
+    bash ~/.acme.sh/acme.sh --install-cert -d ${domain} --key-file /root/cert/${domain}/private.key --fullchain-file /root/cert/${domain}/cert.crt --ecc
+}
+
 menu() {
     clear
     echo "#############################################################"
@@ -139,12 +230,6 @@ menu() {
     case "$menuInput" in
         1 ) inst_acme ;;
         2 ) unst_acme ;;
-        3 ) acme_standalone ;;
-        4 ) acme_cfapiTLD ;;
-        5 ) acme_cfapiNTLD ;;
-        6 ) view_cert ;;
-        7 ) revoke_cert ;;
-        8 ) renew_cert ;;
         9 ) switch_provider ;;
         * ) exit 1 ;;
     esac
